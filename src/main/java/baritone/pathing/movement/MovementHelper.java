@@ -30,9 +30,11 @@ import baritone.utils.ToolSet;
 import net.minecraft.block.*;
 import net.minecraft.block.properties.PropertyBool;
 import net.minecraft.block.state.IBlockState;
+import net.minecraft.client.entity.EntityPlayerSP;
 import net.minecraft.init.Blocks;
 import net.minecraft.util.EnumFacing;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.RayTraceResult;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.IBlockAccess;
@@ -42,9 +44,9 @@ import java.util.Optional;
 import static baritone.pathing.movement.Movement.HORIZONTALS_BUT_ALSO_DOWN_____SO_EVERY_DIRECTION_EXCEPT_UP;
 
 /**
- * Static helpers for cost calculation
+ * Static helpers for cost calculation and movement execution
  *
- * @author leijurv
+ * @author leijurv & dkm
  */
 public interface MovementHelper extends ActionCosts, Helper {
 
@@ -432,9 +434,7 @@ public interface MovementHelper extends ActionCosts, Helper {
      * @param ts  previously calculated ToolSet
      */
     static void switchToBestToolFor(IPlayerContext ctx, IBlockState b, ToolSet ts, boolean preferSilkTouch) {
-        if (!Baritone.settings().disableAutoTool.value && !Baritone.settings().assumeExternalAutoTool.value) {
-            ctx.player().inventory.currentItem = ts.getBestSlot(b.getBlock(), preferSilkTouch);
-        }
+        ctx.player().inventory.currentItem = ts.getBestSlot(b.getBlock(), preferSilkTouch);
     }
 
     static void moveTowards(IPlayerContext ctx, MovementState state, BlockPos pos) {
@@ -445,6 +445,7 @@ public interface MovementHelper extends ActionCosts, Helper {
                 false
         )).setInput(Input.MOVE_FORWARD, true);
     }
+
 
     /**
      * Returns whether or not the specified block is
@@ -509,12 +510,12 @@ public interface MovementHelper extends ActionCosts, Helper {
         Optional<Rotation> direct = RotationUtils.reachable(ctx, placeAt, wouldSneak); // we assume that if there is a block there, it must be replacable
         boolean found = false;
         if (direct.isPresent()) {
-            state.setTarget(new MovementState.MovementTarget(direct.get(), true));
+            state.setTarget(new MovementTarget(direct.get(), true));
             found = true;
         }
         for (int i = 0; i < 5; i++) {
             BlockPos against1 = placeAt.offset(HORIZONTALS_BUT_ALSO_DOWN_____SO_EVERY_DIRECTION_EXCEPT_UP[i]);
-            if (MovementHelper.canPlaceAgainst(ctx, against1)) {
+            if (MovementHelperMarius.canPlaceAgainst(ctx, against1)) {
                 if (!((Baritone) baritone).getInventoryBehavior().selectThrowawayForLocation(false, placeAt.getX(), placeAt.getY(), placeAt.getZ())) { // get ready to place a throwaway block
                     Helper.HELPER.logDebug("bb pls get me some blocks. dirt, netherrack, cobble");
                     state.setStatus(MovementStatus.UNREACHABLE);
@@ -526,7 +527,7 @@ public interface MovementHelper extends ActionCosts, Helper {
                 Rotation place = RotationUtils.calcRotationFromVec3d(wouldSneak ? RayTraceUtils.inferSneakingEyePosition(ctx.player()) : ctx.playerHead(), new Vec3d(faceX, faceY, faceZ), ctx.playerRotations());
                 RayTraceResult res = RayTraceUtils.rayTraceTowards(ctx.player(), place, ctx.playerController().getBlockReachDistance(), wouldSneak);
                 if (res != null && res.typeOfHit == RayTraceResult.Type.BLOCK && res.getBlockPos().equals(against1) && res.getBlockPos().offset(res.sideHit).equals(placeAt)) {
-                    state.setTarget(new MovementState.MovementTarget(place, true));
+                    state.setTarget(new MovementTarget(place, true));
                     found = true;
 
                     if (!preferDown) {
@@ -541,7 +542,7 @@ public interface MovementHelper extends ActionCosts, Helper {
             BlockPos selectedBlock = ctx.getSelectedBlock().get();
             EnumFacing side = ctx.objectMouseOver().sideHit;
             // only way for selectedBlock.equals(placeAt) to be true is if it's replacable
-            if (selectedBlock.equals(placeAt) || (MovementHelper.canPlaceAgainst(ctx, selectedBlock) && selectedBlock.offset(side).equals(placeAt))) {
+            if (selectedBlock.equals(placeAt) || (MovementHelperMarius.canPlaceAgainst(ctx, selectedBlock) && selectedBlock.offset(side).equals(placeAt))) {
                 if (wouldSneak) {
                     state.setInput(Input.SNEAK, true);
                 }
@@ -562,4 +563,141 @@ public interface MovementHelper extends ActionCosts, Helper {
     enum PlaceResult {
         READY_TO_PLACE, ATTEMPTING, NO_OPTION;
     }
+
+    /**
+     * Calculates the Y-Momentum, after t-Ticks of jumping.
+     *
+     * @param t number of ticks after jumping
+     * @return Y-Momentum, after t-Ticks
+     */
+    static double calcJumpMomentum(int t) {
+        return -0.0784 * (1 - Math.pow(0.98, t)) / (1 - 0.98) + Math.pow(0.98, t) * 0.42;
+    }
+
+    /**
+     * Calculate the number of ticks in the air, when jumping.
+     *
+     * @param relative how high/low to jump, relative to the start
+     * @return number of ticks in the air
+     */
+    static int ticksToLand(double relative) {
+        double height = 0;
+        //After 5  Ticks we reach our height point an we always land on our way down. So only start at tick 5 to go back
+        //This can be written diffenrently
+        for (int t = 0; t < 256; t++) {
+            if (height < relative && t > 5)
+                return t;
+            height += calcJumpMomentum(t);
+        }
+        return 0;
+    }
+
+    /**
+     * Gets the inertia/slipperiness of the block under the player
+     *
+     * @param player The player to use
+     * @return inertia of the specified block
+     */
+    static float getGroundInertia(EntityPlayerSP player) {
+        //or BlockStateInterface.getBlock(ctx, dest).slipperiness?
+        return player.world.getBlockState(new BlockPos(MathHelper.floor(player.posX), MathHelper.floor(player.posY) - 1.0D, MathHelper.floor(player.posZ))).getBlock().slipperiness * 0.91F;
+    }
+
+    /**
+     * Calculates how far the player would travel, when jumping in that tick.<br>
+     * Only walking/sprinting forward is supported, not strafe.<br>
+     *
+     * <p>
+     * Watch out, when landing, the last tick is still air movement, but you already collide with the block in front of you.<br>
+     * So you should always calculate one tick less for the reach.
+     * </p>
+     *
+     * <a href="https://www.mcpk.wiki/wiki/Movement_Physics"> Great information, about the movement physics</a><br>
+     *
+     * <b>dir must be capitalized</b><br>
+     * <p>
+     * TODO More general by not using EntityPlayerSP?
+     *
+     * @param player The player, which is going to move
+     * @param ticks  Number of ticks the player moves
+     * @param dir    X or Z, in which direction to calculate
+     * @param sprint Whether to sprint or not
+     * @return How far relative the player is going to move.
+     * @see net.minecraft.entity.EntityLivingBase#travel(float, float, float)
+     */
+    static double jumpReach(EntityPlayerSP player, int ticks, char dir, boolean sprint) {
+
+        double reach = 0.0;
+        float yaw = player.rotationYaw; //Should this become it's own variable?
+
+        //We first have to add the one tick of ground movement.
+        double motion = fwdGroundTick(player, dir, sprint, true);
+        reach += motion;
+        //We still have ground, bc our Positions hasn't changed yet
+        motion *= getGroundInertia(player);
+
+        float trig = (dir == 'Z') ? MathHelper.cos(yaw * 0.017453292F) : -MathHelper.sin(yaw * 0.017453292F); // 0.017453292F = Math.PI / 180.0F
+
+        trig *= ((sprint) ? 0.02548F : 0.0196F); // 0.02548 =  0.98 * (0.02 + 0.02 * 0.3); 0.0196 = 0.98 * 0.02
+
+        //We start counting at the second tick, since we already calculated the 1.
+        for (int tick = 1; tick < ticks; tick++) {
+            motion += trig;
+            reach += motion;
+            motion *= 0.91; //drag
+        }
+        return reach;
+    }
+
+    /**
+     * Calculates the momentum of the player after one tick on the ground.<br>
+     * Only walking/sprinting forward is supported, not strafe.<br>
+     * If jumping and sprinting the player receives a boost.<br>
+     *
+     * <b>dir must be capitalized</b><br>
+     * <p>
+     *
+     * @param motion    The motion of the player, in which to be calculated(either X or Z)
+     * @param inertia   The inertia of the block the player is currently standing on
+     * @param yaw   The Yaw of the player
+     * @param dir   X or Z, in which direction to calculate
+     * @param sprint    Whether to sprint or not
+     * @param jump  Whether to jump int that tick or not. This gives the "jumpboost"
+     *
+     * @return Motion after a Tick on the ground
+     *
+     * @see MovementHelperMarius#jumpReach(EntityPlayerSP, int, char, boolean)
+     * @see net.minecraft.entity.EntityLivingBase#travel(float, float, float)
+     */
+    static double fwdGroundTick(double motion, float inertia, float yaw, char dir, boolean sprint, boolean jump) {
+        float movementFactor = (0.16277136F / (inertia * inertia * inertia));
+        float trig = (dir == 'Z') ? MathHelper.cos(yaw * 0.017453292F) : -MathHelper.sin(yaw * 0.017453292F);
+        motion += movementFactor * trig * (sprint ? 0.12739 : 0.098) + ((sprint && jump) ? trig * 0.2 : 0); // 0.1274 =  0.98 * 0.13; 0.098 = 0.98 * 0.1
+        return motion;
+    }
+    /**
+     * Calculates the momentum of the player after one tick on the ground.<br>
+     * Only walking/sprinting forward is supported, not strafe.<br>
+     * If jumping and sprinting the player receives a boost.<br>
+     *
+     * <b>dir must be capitalized</b><br>
+     * <p>
+     * TODO More general by not using EntityPlayerSP??
+     *
+     * @param player The player, which is going to move
+     * @param dir    X or Z, in which direction to calculate
+     * @param sprint Whether to sprint or not
+     * @param jump   Whether to jump int that tick or not. This gives the "jumpboost"
+     *
+     * @return Motion after a Tick on the ground
+     *
+     * @see MovementHelperMarius#jumpReach(EntityPlayerSP, int, char, boolean)
+     * @see net.minecraft.entity.EntityLivingBase#travel(float, float, float)
+     */
+    static double fwdGroundTick(EntityPlayerSP player, char dir, boolean sprint, boolean jump) {
+        return fwdGroundTick((dir == 'Z') ? player.motionZ:player.motionX, getGroundInertia(player), player.rotationYaw,dir , sprint, jump);
+    }
+
+
+
 }
